@@ -13,7 +13,12 @@ name: Crypto trading bot
 
 on:
   schedule:
-    - cron: "0 * * * *"        # hourly, at minute :00 UTC
+    # Hourly, at minute :17. We avoid :00 because GitHub Actions cron is
+    # extremely congested at the top of the hour — delays of 30 min to
+    # several hours are common there. Off-peak minutes start within ~5 min
+    # of the scheduled time in practice. The strategy is robust to a few
+    # minutes of jitter (we use smoothed funding rates, not exact ones).
+    - cron: "17 * * * *"
   workflow_dispatch:            # also allow manual triggering from the UI
     inputs:
       live:
