@@ -105,6 +105,47 @@ Each run uploads its log files as a downloadable artifact. From the Actions tab,
 open any run and scroll down to **Artifacts** → `bot-logs-<run-id>` — that's a
 zip with `bot.log` and `heartbeat` exactly as they would be on a VPS.
 
+### Step 0.8 — Discord notifications (optional, ~2 min)
+
+Want a ping on your phone whenever the bot opens or closes a position, hits
+an error, or sends the daily check-in? Add a Discord webhook.
+
+What gets notified (only when `BOT_LIVE=true`):
+  - Every live order placed (entry, exit, rotation, EMA in/out)
+  - Cycle crashes and safety halts
+  - One daily check-in at 00:00 UTC (equity, current positions)
+
+What does NOT get notified (intentionally):
+  - Successful hourly cycles where nothing changed — would be 24 pings/day of pure noise
+  - Dry-run order bodies — log file is the right place for those
+
+**Setup:**
+
+1. In Discord, open the server + channel where you want notifications.
+2. Channel settings (gear icon) → **Integrations** → **Webhooks** → **New Webhook**.
+3. Name it (e.g., "bitget-bot"), optionally upload an icon, click **Copy Webhook URL**.
+4. Back in your GitHub repo: **Settings → Secrets and variables → Actions → Secrets tab → New repository secret**.
+   - Name:  `DISCORD_WEBHOOK_URL`
+   - Value: paste the webhook URL
+5. Save.
+
+**Test it before flipping to live trading.** From your local machine:
+
+```powershell
+# Put the same webhook URL in your local .env file:
+#   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+
+run.bat notify.py "hello from the bot"
+```
+
+A bright blue test embed should appear in the Discord channel within a second.
+If you don't get one, the URL is wrong or your channel revoked the webhook —
+re-copy and re-paste.
+
+To stop notifications later: delete the GitHub secret, or revoke the webhook
+in Discord. The bot keeps running normally; every `notify()` call becomes a
+silent no-op.
+
 ----------------------------------------------------------------
 ## When to graduate from GitHub Actions to a VPS
 

@@ -32,7 +32,8 @@ from bitget_funding import load_or_fetch_funding
 from bitget_klines import fetch_klines, load_or_fetch
 from config import BitgetConfig, load_bitget_config
 from logger import heartbeat, log
-from reconcile import PositionView
+from notify import notify_daily_summary, notify_error, notify_test
+from reconcile import PositionView, fetch_state
 from safety import SafetyLimits, SessionState
 from scheduler import (
     CARRY_UNIVERSE, EMA_SYMBOL, SchedulerInputs, StrategyConfig, evaluate_once,
@@ -187,6 +188,8 @@ def run_continuous(
         except Exception as e:
             log.info(f"  [ERROR] cycle {cycle} crashed: {type(e).__name__}: {e}")
             log.info("  [INFO] continuing — next cycle will retry.")
+            if not dry_run:
+                notify_error(f"{type(e).__name__}: {e}", cycle=cycle)
 
         if stopper.requested:
             break
@@ -246,12 +249,41 @@ def main() -> int:
         )
 
     # Single-pass mode
-    inputs = _build_inputs(
-        cfg=cfg, client=client, mock_account=args.mock_account,
-        capital_override=args.capital, carry_frac=args.carry_frac, dry_run=dry_run,
-    )
-    result = evaluate_once(inputs)
+    try:
+        inputs = _build_inputs(
+            cfg=cfg, client=client, mock_account=args.mock_account,
+            capital_override=args.capital, carry_frac=args.carry_frac, dry_run=dry_run,
+        )
+        result = evaluate_once(inputs)
+    except Exception as e:
+        log.info(f"  [ERROR] single-pass crashed: {type(e).__name__}: {e}")
+        if not dry_run:
+            notify_error(f"{type(e).__name__}: {e}")
+        raise
     heartbeat(extra=f"single_pass target={result.get('carry_target')} actions={len(result.get('actions', []))}")
+
+    # Daily check-in: send once when the cron lands in the 0:xx UTC hour.
+    # GH Actions cron has 5-15 min jitter, so anchor on the hour rather than exact minute.
+    now_utc = datetime.now(timezone.utc)
+    if not dry_run and now_utc.hour == 0:
+        # Re-query position view (cheap, already cached on `client`)
+        if client is not None:
+            try:
+                pv = fetch_state(client)
+                ema_holding = pv.spot_balances.get("BTC", 0.0) > 0
+                equity = pv.total_equity_usd if pv.total_equity_usd > 0 else inputs.strategy.total_capital_usd
+            except Exception:
+                ema_holding = False
+                equity = inputs.strategy.total_capital_usd
+        else:
+            ema_holding = False
+            equity = inputs.strategy.total_capital_usd
+        notify_daily_summary(
+            equity_usd=equity,
+            carry_target=result.get("carry_target"),
+            ema_holding=ema_holding,
+        )
+
     if result.get("halted"):
         log.info(f"\n[HALTED] {result.get('reason')}")
         return 1

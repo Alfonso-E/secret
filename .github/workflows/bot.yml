@@ -40,6 +40,9 @@ jobs:
       BITGET_API_KEY:        ${{ secrets.BITGET_API_KEY }}
       BITGET_API_SECRET:     ${{ secrets.BITGET_API_SECRET }}
       BITGET_API_PASSPHRASE: ${{ secrets.BITGET_API_PASSPHRASE }}
+      # Optional: Discord notifications for live trades, errors, daily summary.
+      # If unset, all notify() calls are silent no-ops.
+      DISCORD_WEBHOOK_URL:   ${{ secrets.DISCORD_WEBHOOK_URL }}
       # Set this repo VARIABLE (not secret) to "true" when you're ready to flip
       # to real demo trading. Default: dry-run.
       BOT_LIVE: ${{ vars.BOT_LIVE || 'false' }}

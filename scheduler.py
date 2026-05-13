@@ -32,6 +32,7 @@ from bitget_orders import (
 from bitget_symbols import SymbolInfo, fetch_symbol_info
 from config import BitgetConfig
 from logger import log
+from notify import notify_halt, notify_trade
 from reconcile import (
     CarryIntent, DiffAction, EmaIntent, PositionView, compute_diff, fetch_state,
 )
@@ -257,6 +258,8 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
         guards.check_can_trade()
     except SafetyError as e:
         log.info(f"  [HALT] {e}")
+        if not inputs.dry_run:
+            notify_halt(str(e))
         return {"halted": True, "reason": str(e)}
 
     # 1. Current state (real or mocked)
@@ -336,22 +339,52 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
             if action.kind == "close_carry":
                 all_orders.extend(_place_carry_close(action, inputs.config, inputs.client, inputs.dry_run))
                 guards.register_position_change(f"{action.symbol}_carry", -action.notional_usd)
+                if not inputs.dry_run:
+                    notify_trade(
+                        action="close_carry", symbol=action.symbol, side="Sell",
+                        qty=f"{action.spot_qty:.6g}", notional_usd=action.notional_usd,
+                        reason=action.reason,
+                    )
             elif action.kind == "open_carry":
                 all_orders.extend(_place_carry_open(action, inputs.config, inputs.client,
                                                     cfg.carry_leverage, inputs.dry_run))
                 guards.register_position_change(f"{action.symbol}_carry", action.notional_usd)
+                if not inputs.dry_run:
+                    notify_trade(
+                        action="open_carry", symbol=action.symbol, side="Buy",
+                        qty=f"{action.spot_qty:.6g}", notional_usd=action.notional_usd,
+                        reason=action.reason,
+                        extra={"Leverage (perp)": f"{cfg.carry_leverage:.0f}x"},
+                    )
             elif action.kind == "open_ema":
                 all_orders.extend(_place_ema_open(
                     action, inputs.config, inputs.client, inputs.dry_run,
                     atr=ema_state["atr"], stop_mult=cfg.ema_params.atr_stop_mult,
                 ))
                 guards.register_position_change(f"{action.symbol}_ema", action.notional_usd)
+                if not inputs.dry_run:
+                    stop_estimate = action.spot_price - cfg.ema_params.atr_stop_mult * ema_state["atr"]
+                    notify_trade(
+                        action="open_ema", symbol=action.symbol, side="Buy",
+                        qty=f"{action.spot_qty:.6g}", notional_usd=action.notional_usd,
+                        reason=action.reason,
+                        extra={
+                            "Entry (approx)": f"${action.spot_price:,.2f}",
+                            "Stop trigger":   f"${stop_estimate:,.2f}",
+                        },
+                    )
             elif action.kind == "close_ema":
                 all_orders.extend(_place_ema_close(
                     action, inputs.config, inputs.client, inputs.dry_run,
                     current=current,
                 ))
                 guards.register_position_change(f"{action.symbol}_ema", -action.notional_usd)
+                if not inputs.dry_run:
+                    notify_trade(
+                        action="close_ema", symbol=action.symbol, side="Sell",
+                        qty=f"{action.spot_qty:.6g}", notional_usd=action.notional_usd,
+                        reason=action.reason,
+                    )
         except ValueError as e:
             log.info(f"  [SKIP] {action.symbol}: {e}")
 
