@@ -73,14 +73,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore market-data cache
-        uses: actions/cache@v4
+      # Persist data/ (market caches) AND logs/ (state.json with peak equity,
+      # run counter, etc.) across runs. We use restore-keys to find the most
+      # recent cache from any prior run, then save with a unique key so each
+      # cycle creates a fresh cache entry (old ones evict via LRU).
+      - name: Restore previous state + market-data cache
+        uses: actions/cache/restore@v4
         with:
-          path: data/
-          # Bumping the suffix invalidates the cache. Daily key is fine —
-          # the bot top-up-fetches new candles each run anyway.
-          key:  market-data-${{ github.run_number }}
+          path: |
+            data/
+            logs/
+          key:  bot-state-${{ github.run_id }}
           restore-keys: |
+            bot-state-
             market-data-
 
       - name: Run bot (single pass)
@@ -94,6 +99,15 @@ jobs:
             echo "Running in DRY-RUN mode."
           fi
           python live_bot.py $MODE_FLAG
+
+      - name: Save updated state + market-data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/
+            logs/
+          key: bot-state-${{ github.run_id }}
 
       - name: Upload logs
         if: always()

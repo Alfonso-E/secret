@@ -32,12 +32,13 @@ from bitget_funding import load_or_fetch_funding
 from bitget_klines import fetch_klines, load_or_fetch
 from config import BitgetConfig, load_bitget_config
 from logger import heartbeat, log
-from notify import notify_daily_summary, notify_error, notify_test
+from notify import notify_daily_summary, notify_error, notify_halt, notify_test
 from reconcile import PositionView, fetch_state
 from safety import SafetyLimits, SessionState
 from scheduler import (
     CARRY_UNIVERSE, EMA_SYMBOL, SchedulerInputs, StrategyConfig, evaluate_once,
 )
+from state import load_state, record_halt, save_state, update_for_cycle
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -249,39 +250,93 @@ def main() -> int:
         )
 
     # Single-pass mode
+    persistent = load_state()
+    log.info(f"  Persistent state: runs={persistent.total_runs}  "
+             f"peak_equity=${persistent.peak_equity_usd:,.2f}  "
+             f"peak_at={persistent.peak_equity_utc or '(never)'}")
+    current_eq = 0.0  # set before any exception so finally block can still record
     try:
         inputs = _build_inputs(
             cfg=cfg, client=client, mock_account=args.mock_account,
             capital_override=args.capital, carry_frac=args.carry_frac, dry_run=dry_run,
         )
+        current_eq = inputs.strategy.total_capital_usd
+
+        # Cross-run drawdown check — replaces the broken session-state version.
+        dd = persistent.drawdown_from_peak(current_eq)
+        max_dd_allowed = -inputs.limits.max_daily_loss_pct / 100.0
+        if persistent.peak_equity_usd > 0 and dd <= max_dd_allowed:
+            reason = (f"Cross-run drawdown {dd*100:+.2f}% from peak "
+                      f"${persistent.peak_equity_usd:,.2f} ({persistent.peak_equity_utc}) "
+                      f"breached limit {max_dd_allowed*100:+.2f}%")
+            log.info(f"  [HALT] {reason}")
+            if not dry_run:
+                notify_halt(reason)
+            persistent = record_halt(persistent, reason)
+            save_state(persistent)
+            return 1
+
         result = evaluate_once(inputs)
     except Exception as e:
         log.info(f"  [ERROR] single-pass crashed: {type(e).__name__}: {e}")
         if not dry_run:
             notify_error(f"{type(e).__name__}: {e}")
         raise
+    finally:
+        # Always bookkeep run count + peak, even on crash, so we don't lose history.
+        try:
+            persistent = update_for_cycle(persistent, current_eq)
+            save_state(persistent)
+        except Exception as save_err:
+            log.warning(f"  Could not save persistent state: {save_err}")
     heartbeat(extra=f"single_pass target={result.get('carry_target')} actions={len(result.get('actions', []))}")
 
     # Daily check-in: send once when the cron lands in the 0:xx UTC hour.
     # GH Actions cron has 5-15 min jitter, so anchor on the hour rather than exact minute.
     now_utc = datetime.now(timezone.utc)
     if not dry_run and now_utc.hour == 0:
-        # Re-query position view (cheap, already cached on `client`)
+        equity = inputs.strategy.total_capital_usd
+        ema_holding = False
+        extra_lines: list[str] = []
         if client is not None:
             try:
                 pv = fetch_state(client)
                 ema_holding = pv.spot_balances.get("BTC", 0.0) > 0
-                equity = pv.total_equity_usd if pv.total_equity_usd > 0 else inputs.strategy.total_capital_usd
-            except Exception:
-                ema_holding = False
-                equity = inputs.strategy.total_capital_usd
-        else:
-            ema_holding = False
-            equity = inputs.strategy.total_capital_usd
+                if pv.total_equity_usd > 0:
+                    equity = pv.total_equity_usd
+
+                # Drawdown vs peak (helps you see when the bot has bled vs is at fresh highs)
+                if persistent.peak_equity_usd > 0:
+                    dd = persistent.drawdown_from_peak(equity) * 100
+                    extra_lines.append(
+                        f"Peak ${persistent.peak_equity_usd:,.2f} ({persistent.peak_equity_utc[:10]}) "
+                        f"| DD {dd:+.2f}%"
+                    )
+
+                # Current funding rate of the held carry asset (annualized for context)
+                held = next(iter(pv.perp_shorts.keys()), None)
+                if held and held in inputs.funding_panel.columns:
+                    smoothed = float(inputs.funding_panel[held].tail(9).mean())
+                    apr = smoothed * 3 * 365 * 100
+                    extra_lines.append(f"{held} funding: {smoothed:+.6f}/8h ({apr:+.2f}% APR)")
+
+                # Liquidation buffer for the perp short
+                for sym, size in pv.perp_shorts.items():
+                    entry = pv.perp_entries.get(sym, 0.0)
+                    cur = inputs.perp_prices.get(sym, 0.0)
+                    if entry > 0 and cur > 0:
+                        approx_liq = entry * 1.15  # rough for 5x isolated
+                        buffer = (approx_liq - cur) / cur * 100
+                        extra_lines.append(f"{sym} liq buffer ~{buffer:.1f}%")
+            except Exception as e:
+                extra_lines.append(f"(could not enrich: {type(e).__name__})")
+        extra_lines.append(f"Runs since start: {persistent.total_runs}")
+
         notify_daily_summary(
             equity_usd=equity,
             carry_target=result.get("carry_target"),
             ema_holding=ema_holding,
+            extra_lines=extra_lines,
         )
 
     if result.get("halted"):

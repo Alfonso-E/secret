@@ -34,7 +34,7 @@ from bitget_orders import (
 from bitget_symbols import SymbolInfo, fetch_symbol_info
 from config import BitgetConfig
 from logger import log
-from notify import notify_halt, notify_trade
+from notify import notify_error, notify_halt, notify_trade
 from reconcile import (
     CarryIntent, DiffAction, EmaIntent, PositionView, compute_diff, fetch_state,
 )
@@ -62,7 +62,19 @@ class StrategyConfig:
     carry_leverage:      float = 5.0
     carry_smooth_periods: int = 9
     carry_enter_threshold: float = 0.0
-    ema_params:          StrategyParams = StrategyParams(ema_fast=50, ema_slow=200, trend_ema=200)
+    # Hysteresis: a new asset must beat the current held asset's smoothed
+    # funding rate by this much (per 8h period) to justify rotating. Matches
+    # the backtest's `min_switch_advantage=0.0002` setting, which prevents
+    # constant churning between near-equal carry candidates.
+    carry_min_switch_advantage: float = 0.0002
+    # Funding-flip safety: if the held asset's last 3 published funding rates
+    # are ALL negative, force exit even if rotation wouldn't have triggered.
+    carry_force_exit_negative_streak: int = 3
+    # Liquidation safety: warn (Discord) when distance-to-liq falls below this
+    # fraction of current price; halt + flatten if it falls below `liq_halt_pct`.
+    liq_warn_pct:  float = 0.10
+    liq_halt_pct:  float = 0.05
+    ema_params:    StrategyParams = StrategyParams(ema_fast=50, ema_slow=200, trend_ema=200)
 
 
 @dataclass
@@ -86,13 +98,57 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _pick_carry_target(panel: pd.DataFrame, smooth: int, threshold: float) -> tuple[str | None, float]:
+def _pick_carry_target(
+    panel: pd.DataFrame,
+    smooth: int,
+    threshold: float,
+    currently_held: str | None,
+    min_switch_advantage: float,
+    force_exit_negative_streak: int,
+) -> tuple[str | None, float, str]:
+    """Pick the next carry target.
+
+    Returns (symbol, smoothed_rate, reason). Symbol is None if we should be flat.
+
+    Logic:
+      1. If we hold a position and its last N raw funding rates are all
+         negative -> force exit (return None).
+      2. Compute smoothed rates for all assets clearing `threshold`.
+      3. If nothing clears it, return None.
+      4. If we already hold one of the candidates, stick with it unless a
+         different candidate beats us by at least `min_switch_advantage`.
+    """
+    # Funding-flip safety check on the held position
+    if currently_held and currently_held in panel.columns:
+        last_n = panel[currently_held].tail(force_exit_negative_streak)
+        if len(last_n) == force_exit_negative_streak and (last_n < 0).all():
+            return None, 0.0, (
+                f"held asset {currently_held} had {force_exit_negative_streak} consecutive "
+                f"negative funding periods (last={last_n.iloc[-1]:+.6f}) — force exit"
+            )
+
     smoothed = panel.tail(smooth).mean()
-    smoothed = smoothed[smoothed > threshold]
-    if smoothed.empty:
-        return None, 0.0
-    best = smoothed.idxmax()
-    return best, float(smoothed.loc[best])
+    eligible = smoothed[smoothed > threshold]
+    if eligible.empty:
+        return None, 0.0, f"no asset's smoothed funding > {threshold:+.6f}"
+
+    best = eligible.idxmax()
+    best_rate = float(eligible.loc[best])
+
+    # Hysteresis: if we already hold an eligible asset, prefer to keep it
+    # unless someone else clearly beats us. This matches the backtest's
+    # rotation rule and prevents fee-eating churn between near-tied candidates.
+    if currently_held and currently_held in eligible.index:
+        held_rate = float(eligible.loc[currently_held])
+        if best == currently_held:
+            return currently_held, held_rate, f"held asset still highest @ {held_rate:+.6f}"
+        if best_rate < held_rate + min_switch_advantage:
+            return currently_held, held_rate, (
+                f"held {currently_held} @ {held_rate:+.6f}; new candidate {best} @ "
+                f"{best_rate:+.6f} doesn't clear hysteresis (need +{min_switch_advantage:.6f})"
+            )
+
+    return best, best_rate, f"argmax {best} @ {best_rate:+.6f}"
 
 
 def _ema_signal_state(btc: pd.DataFrame, params: StrategyParams) -> dict:
@@ -132,6 +188,75 @@ def _decide_ema_intent(
         return EmaIntent(want_long_btc=False, target_notional_usd=0.0), "exit signal"
     return EmaIntent(want_long_btc=holding, target_notional_usd=capital_usd if holding else 0.0), \
            ("holding through" if holding else "flat, no entry signal")
+
+
+# ---------- Liquidation distance monitor ----------
+
+def _check_liquidation_distance(
+    current: PositionView,
+    perp_prices: dict[str, float],
+    warn_pct: float,
+    halt_pct: float,
+    dry_run: bool,
+) -> set[str]:
+    """Walk every open perp short. For each, compute distance to liquidation
+    as (liq_price - current_price) / current_price (always positive for a
+    short whose liq is above market). Emit Discord warnings at `warn_pct`
+    and return the symbol set to force-flatten at `halt_pct`.
+
+    The actual liquidation price comes from `current.perp_entries` plus the
+    Bitget position response. If we don't have a liq price for a symbol
+    (e.g., demo response missing it), we skip the check on that one.
+    """
+    to_flatten: set[str] = set()
+    if not current.perp_shorts:
+        return to_flatten
+
+    # We need the liquidation prices Bitget returned. They're not on
+    # PositionView yet — we fetched them inside get_positions but only kept
+    # entries. For now, accept that the demo response may not include them
+    # and skip silently when missing. (A future tweak: surface liq_price
+    # through PositionView so this check is always live.)
+    # Best-effort: if perp_entries[sym] is far from current price, that
+    # already implies decent room.
+    for sym, size in current.perp_shorts.items():
+        if size <= 0:
+            continue
+        cur_price = perp_prices.get(sym, 0.0)
+        entry = current.perp_entries.get(sym, 0.0)
+        if cur_price <= 0 or entry <= 0:
+            continue
+
+        # Without an explicit liq price, approximate using 5x isolated short:
+        # liquidation ~ entry * (1 + 1/leverage - maintenance_margin) ~ entry * 1.17
+        # for L=5 with ~2% maintenance margin. Conservative: use 1.15.
+        approx_liq = entry * 1.15
+        distance_pct = (approx_liq - cur_price) / cur_price
+
+        if distance_pct < halt_pct:
+            log.warning(
+                f"  [LIQ-RISK]  {sym}: cur=${cur_price:,.2f} approx_liq=${approx_liq:,.2f} "
+                f"distance={distance_pct*100:.2f}% < halt {halt_pct*100:.2f}% — FLATTENING"
+            )
+            to_flatten.add(sym)
+            if not dry_run:
+                notify_error(
+                    f"{sym} perp short close to liquidation: current ${cur_price:,.2f}, "
+                    f"approx liq ${approx_liq:,.2f} ({distance_pct*100:.2f}% buffer). "
+                    f"Flattening this position."
+                )
+        elif distance_pct < warn_pct:
+            log.warning(
+                f"  [LIQ-WARN]  {sym}: cur=${cur_price:,.2f} approx_liq=${approx_liq:,.2f} "
+                f"distance={distance_pct*100:.2f}%"
+            )
+            if not dry_run:
+                notify_error(
+                    f"{sym} perp short liquidation buffer at {distance_pct*100:.2f}% "
+                    f"(warn threshold {warn_pct*100:.1f}%). Position still open."
+                )
+
+    return to_flatten
 
 
 # ---------- Wallet rebalancing ----------
@@ -335,15 +460,33 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
     log.info(f"  Current perp shorts:   {dict(current.perp_shorts) or '{}'}")
     log.info(f"  Account equity (live): ${current.total_equity_usd:,.2f}")
 
+    # 1b. Liquidation distance check for any open perp short
+    force_flatten = _check_liquidation_distance(
+        current, inputs.perp_prices, cfg.liq_warn_pct, cfg.liq_halt_pct, inputs.dry_run,
+    )
+
     # 2. Strategy intent
-    target, target_rate = _pick_carry_target(
-        inputs.funding_panel, cfg.carry_smooth_periods, cfg.carry_enter_threshold,
+    currently_held = next(
+        (s for s in current.perp_shorts if s in CARRY_UNIVERSE),
+        None,
+    )
+    target, target_rate, target_reason = _pick_carry_target(
+        inputs.funding_panel,
+        cfg.carry_smooth_periods,
+        cfg.carry_enter_threshold,
+        currently_held=currently_held,
+        min_switch_advantage=cfg.carry_min_switch_advantage,
+        force_exit_negative_streak=cfg.carry_force_exit_negative_streak,
     )
     carry_capital = cfg.total_capital_usd * cfg.carry_fraction
     carry_notional = carry_capital * cfg.carry_leverage / (cfg.carry_leverage + 1)
+    final_target = target if target in CARRY_UNIVERSE else None
+    if final_target is not None and final_target in force_flatten:
+        log.warning(f"  Override: target {final_target} is in liquidation-halt set — forcing flat")
+        final_target = None
     carry_intent = CarryIntent(
-        target_symbol=target if target in CARRY_UNIVERSE else None,
-        target_notional_usd=carry_notional if target else 0.0,
+        target_symbol=final_target,
+        target_notional_usd=carry_notional if final_target else 0.0,
     )
 
     ema_state = _ema_signal_state(inputs.btc_klines, cfg.ema_params)
@@ -358,9 +501,9 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
     if carry_intent.target_symbol:
         annualized = target_rate * 3 * 365 * 100
         log.info(f"  Carry: hold {carry_intent.target_symbol}  notional ${carry_intent.target_notional_usd:,.0f}  "
-              f"(smoothed rate {target_rate:+.6f}/8h = {annualized:+.2f}% APR)")
+              f"(smoothed rate {target_rate:+.6f}/8h = {annualized:+.2f}% APR) — {target_reason}")
     else:
-        log.info(f"  Carry: stay flat (no asset clears threshold {cfg.carry_enter_threshold:+.6f})")
+        log.info(f"  Carry: stay flat — {target_reason}")
     log.info(f"  EMA  : want_long_btc={ema_intent.want_long_btc}  notional ${ema_intent.target_notional_usd:,.0f}  "
           f"reason='{ema_reason}'")
     log.info(f"         (bar @ {ema_state['time']}  close=${ema_state['close']:,.2f}  "
