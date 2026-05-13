@@ -19,12 +19,18 @@ on:
     # of the scheduled time in practice. The strategy is robust to a few
     # minutes of jitter (we use smoothed funding rates, not exact ones).
     - cron: "17 * * * *"
-  workflow_dispatch:            # also allow manual triggering from the UI
+  workflow_dispatch:            # manual triggering from the UI
     inputs:
       live:
         description: "Submit real orders? (otherwise dry-run)"
         type: boolean
         default: false
+  # Fallback trigger: external services (cron-job.org, etc.) can POST to
+  #   https://api.github.com/repos/<owner>/<repo>/dispatches
+  # with body {"event_type": "run-bot"} to fire this workflow. Use this if
+  # GitHub's built-in cron proves too unreliable on your private repo.
+  repository_dispatch:
+    types: [run-bot]
 
 # Limit to a single concurrent run — if a previous cycle is still going,
 # skip this one rather than racing it.
