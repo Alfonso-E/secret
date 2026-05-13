@@ -22,7 +22,7 @@ class SafetyError(RuntimeError):
 @dataclass
 class SafetyLimits:
     # Account-level
-    min_equity_usd: float = 1_000.0          # refuse to operate if equity below this
+    min_equity_usd: float = 100.0          # refuse to operate if equity below this
     max_total_notional_usd: float = 50_000.0 # absolute cap on combined positions
     max_single_position_usd: float = 15_000.0 # cap on any one asset
 
