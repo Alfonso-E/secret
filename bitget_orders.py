@@ -2,7 +2,10 @@
 
 Bitget V2 quirks vs Bybit:
   - Sides/order types use LOWERCASE strings ("buy", "sell", "market", "limit").
-  - Spot orders go to /api/v2/spot/trade/place-order with `size` (base coin).
+  - Spot orders go to /api/v2/spot/trade/place-order. CRITICAL: for spot
+    MARKET BUY, `size` is interpreted as QUOTE (USDT) amount, NOT base coin.
+    Spot market SELL and all limit orders use base coin as expected. We
+    handle this branch inside place_order().
   - Futures orders go to /api/v2/mix/order/place-order with `tradeSide` and
     require `marginCoin` + `marginMode`.
   - The "force" field replaces Bybit's "timeInForce".
@@ -90,6 +93,7 @@ def place_order(
     price:       float | None = None,
     reduce_only: bool = False,
     time_in_force: str | None = None,
+    reference_price: float | None = None,   # required for spot MARKET BUY (converts qty -> USDT)
     client:      BitgetClient | None = None,
     dry_run:     bool = True,
 ) -> OrderResult:
@@ -98,11 +102,11 @@ def place_order(
     if order_type == "Market" and price is not None:
         raise ValueError("Market orders should not pass a price")
 
-    err = validate_order(info, qty, price)
+    err = validate_order(info, qty, price or reference_price)
     if err:
         raise ValueError(f"Order rejected by local validation: {err}")
 
-    qty_str = format_qty(info, qty)
+    qty_str = format_qty(info, qty)         # base-coin string, used for our records
     price_str = format_price(info, price) if price is not None else None
 
     if time_in_force is None:
@@ -111,8 +115,24 @@ def place_order(
 
     if info.category == "spot":
         path = "/api/v2/spot/trade/place-order"
-        body = _spot_payload(symbol=info.symbol, side=side, order_type=order_type,
-                             qty=qty_str, price=price_str, force=time_in_force)
+        if order_type == "Market" and side == "Buy":
+            # Bitget V2 spot market BUY expects `size` as QUOTE (USDT) amount.
+            if reference_price is None or reference_price <= 0:
+                raise ValueError(
+                    "Spot market BUY requires a positive reference_price so we can "
+                    "compute the USDT amount Bitget expects in `size`."
+                )
+            usdt_size = qty * reference_price
+            body = {
+                "symbol":    info.symbol,
+                "side":      "buy",
+                "orderType": "market",
+                "force":     time_in_force,
+                "size":      f"{usdt_size:.4f}",
+            }
+        else:
+            body = _spot_payload(symbol=info.symbol, side=side, order_type=order_type,
+                                 qty=qty_str, price=price_str, force=time_in_force)
     else:
         path = "/api/v2/mix/order/place-order"
         body = _futures_payload(symbol=info.symbol, side=side, order_type=order_type,

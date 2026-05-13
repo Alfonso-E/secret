@@ -152,7 +152,8 @@ def _place_carry_open(action: DiffAction, config: BitgetConfig, client: BitgetCl
     if action.spot_qty > 0:
         out.append(place_order(
             info=spot_info, side="Buy", qty=action.spot_qty,
-            order_type="Market", client=client, dry_run=dry_run,
+            order_type="Market", reference_price=action.spot_price,
+            client=client, dry_run=dry_run,
         ))
     if action.perp_qty > 0:
         out.append(place_order(
@@ -194,6 +195,7 @@ def _place_ema_open(
     results: list = []
     results.append(place_order(
         info=info, side="Buy", qty=spec.qty, order_type="Market",
+        reference_price=action.spot_price,
         client=client, dry_run=dry_run,
     ))
     # Place an on-exchange stop-loss alongside the entry. Trigger price is
