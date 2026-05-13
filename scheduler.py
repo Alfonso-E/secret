@@ -58,7 +58,11 @@ EMA_SYMBOL = "BTCUSDT"
 @dataclass
 class StrategyConfig:
     total_capital_usd:   float = 10_000.0
-    carry_fraction:      float = 0.9
+    # Capital split. 0.8 = 80% carry / 20% EMA — gives more upside to the
+    # directional overlay during BTC trends (backtested CAGR ~13% vs 10%
+    # at the conservative 0.9 split), at the cost of higher drawdown
+    # (~-8% vs -4%). Drop to 0.9 for safety, raise to 0.7 for more growth.
+    carry_fraction:      float = 0.8
     carry_leverage:      float = 5.0
     carry_smooth_periods: int = 9
     carry_enter_threshold: float = 0.0
@@ -437,7 +441,7 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
     log.info("=" * 92)
     log.info(f"STRATEGY EVALUATION  {_now_utc().isoformat(timespec='seconds')}  "
           f"dry_run={inputs.dry_run}  capital=${cfg.total_capital_usd:,.0f}  "
-          f"split={int(cfg.carry_fraction*100)}/{int((1 - cfg.carry_fraction)*100)}")
+          f"split={round(cfg.carry_fraction*100)}/{round((1 - cfg.carry_fraction)*100)}")
     log.info("=" * 92)
 
     try:

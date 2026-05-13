@@ -32,20 +32,28 @@ STATE_SCHEMA_VERSION = 1
 
 @dataclass
 class BotState:
-    schema_version:    int = STATE_SCHEMA_VERSION
-    first_run_utc:     str = ""
-    last_run_utc:      str = ""
-    total_runs:        int = 0
-    peak_equity_usd:   float = 0.0
-    peak_equity_utc:   str = ""
-    last_halt_reason:  str = ""
-    last_halt_utc:     str = ""
+    schema_version:      int = STATE_SCHEMA_VERSION
+    first_run_utc:       str = ""
+    last_run_utc:        str = ""
+    total_runs:          int = 0
+    starting_equity_usd: float = 0.0     # set ONCE on the first cycle with non-zero equity; never overwritten
+    peak_equity_usd:     float = 0.0
+    peak_equity_utc:     str = ""
+    last_halt_reason:    str = ""
+    last_halt_utc:       str = ""
 
     def drawdown_from_peak(self, current_equity_usd: float) -> float:
         """Negative number, e.g. -0.07 = -7% drawdown from all-time peak."""
         if self.peak_equity_usd <= 0:
             return 0.0
         return (current_equity_usd / self.peak_equity_usd) - 1.0
+
+    def growth_since_start(self, current_equity_usd: float) -> float:
+        """Cumulative return since the bot first deployed, as a fraction.
+        +0.07 = +7% growth since first run."""
+        if self.starting_equity_usd <= 0:
+            return 0.0
+        return (current_equity_usd / self.starting_equity_usd) - 1.0
 
 
 def _utc_now() -> str:
@@ -79,11 +87,15 @@ def save_state(state: BotState) -> None:
 
 
 def update_for_cycle(state: BotState, current_equity_usd: float) -> BotState:
-    """Bookkeep one cycle: bump run count, update peak if exceeded."""
+    """Bookkeep one cycle: bump run count, capture starting equity, update peak."""
     state.total_runs += 1
     state.last_run_utc = _utc_now()
     if not state.first_run_utc:
         state.first_run_utc = state.last_run_utc
+    # Capture starting equity exactly once, on the first cycle that has a real
+    # balance. This is the anchor we measure cumulative growth against.
+    if state.starting_equity_usd <= 0 and current_equity_usd > 0:
+        state.starting_equity_usd = current_equity_usd
     if current_equity_usd > state.peak_equity_usd:
         state.peak_equity_usd = current_equity_usd
         state.peak_equity_utc = state.last_run_utc

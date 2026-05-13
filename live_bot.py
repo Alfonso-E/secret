@@ -220,8 +220,8 @@ def main() -> int:
                    help="Run continuously; sleep until next funding/hour event.")
     p.add_argument("--capital", type=float, default=10_000.0,
                    help="Override total capital in USD (default 10000; ignored if real balance found).")
-    p.add_argument("--carry-frac", type=float, default=0.9,
-                   help="Carry portion of capital (0.0 to 1.0). Default 0.9 = 90%% carry / 10%% EMA.")
+    p.add_argument("--carry-frac", type=float, default=0.8,
+                   help="Carry portion of capital (0.0 to 1.0). Default 0.8 = 80%% carry / 20%% EMA.")
     args = p.parse_args()
 
     dry_run = not args.live
@@ -305,12 +305,22 @@ def main() -> int:
                 if pv.total_equity_usd > 0:
                     equity = pv.total_equity_usd
 
-                # Drawdown vs peak (helps you see when the bot has bled vs is at fresh highs)
+                # All-time growth (compounding visibility) + drawdown from peak.
+                # If starting_equity is set, we report cumulative growth since
+                # the bot first deployed — this is the headline number that
+                # answers "is compounding actually working?".
+                if persistent.starting_equity_usd > 0:
+                    growth = persistent.growth_since_start(equity) * 100
+                    extra_lines.append(
+                        f"Since start ({persistent.first_run_utc[:10]}): "
+                        f"${persistent.starting_equity_usd:,.2f} -> ${equity:,.2f}  "
+                        f"({growth:+.2f}%)"
+                    )
                 if persistent.peak_equity_usd > 0:
                     dd = persistent.drawdown_from_peak(equity) * 100
                     extra_lines.append(
-                        f"Peak ${persistent.peak_equity_usd:,.2f} ({persistent.peak_equity_utc[:10]}) "
-                        f"| DD {dd:+.2f}%"
+                        f"Peak ${persistent.peak_equity_usd:,.2f} ({persistent.peak_equity_utc[:10]})  "
+                        f"DD {dd:+.2f}%"
                     )
 
                 # Current funding rate of the held carry asset (annualized for context)
