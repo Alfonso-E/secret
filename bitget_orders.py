@@ -269,6 +269,39 @@ def place_spot_stop_loss(
     )
 
 
+def transfer_internal(
+    *,
+    from_type: str,                       # "spot" | "usdt_futures" | "crossed_margin" | "isolated_margin" | ...
+    to_type:   str,
+    amount:    float,
+    coin:      str = "USDT",
+    client:    BitgetClient | None = None,
+    dry_run:   bool = True,
+) -> dict:
+    """Move funds between sub-wallets within the same account.
+
+    Carry trade needs USDT in the spot wallet (to buy the spot leg) AND in the
+    USDT-futures wallet (to back perp short margin). Bitget demo accounts only
+    fund one of these by default, so the bot auto-rebalances before opening.
+    """
+    if from_type == to_type:
+        raise ValueError(f"transfer from_type == to_type ({from_type!r})")
+    body = {
+        "fromType": from_type,
+        "toType":   to_type,
+        "amount":   f"{amount:.4f}",
+        "coin":     coin,
+    }
+    path = "/api/v2/spot/wallet/transfer"
+    if dry_run:
+        log.info(f"  [DRY-RUN] POST {path}  body={json.dumps(body)}")
+        return {"code": "00000", "dry_run": True}
+    if client is None:
+        raise ValueError("dry_run=False requires a BitgetClient")
+    log.info(f"    Transferring ${amount:.2f} {coin}  {from_type} -> {to_type}")
+    return client.post(path, body)
+
+
 def cancel_spot_plan_order(
     *,
     symbol:        str,

@@ -26,8 +26,10 @@ import pandas as pd
 from bitget_client import BitgetClient
 from bitget_funding import load_or_fetch_funding
 from bitget_klines import load_or_fetch
+from bitget_account import get_futures_usdt_available, get_spot_coin_balance
 from bitget_orders import (
     OrderResult, cancel_spot_plan_order, place_order, place_spot_stop_loss,
+    transfer_internal,
 )
 from bitget_symbols import SymbolInfo, fetch_symbol_info
 from config import BitgetConfig
@@ -132,6 +134,47 @@ def _decide_ema_intent(
            ("holding through" if holding else "flat, no entry signal")
 
 
+# ---------- Wallet rebalancing ----------
+
+def _ensure_spot_usdt(
+    needed_usd: float,
+    client: BitgetClient | None,
+    dry_run: bool,
+    buffer_pct: float = 0.5,
+) -> None:
+    """Make sure the spot wallet holds at least `needed_usd * (1 + buffer_pct/100)`.
+
+    If short, transfer the shortfall in from the USDT-futures wallet. In dry-run
+    mode we just log the intended transfer. On a fresh demo account where all
+    USDT lives in the futures wallet, this is the step that unblocks the spot
+    leg of the carry trade.
+    """
+    if needed_usd <= 0:
+        return
+    target = needed_usd * (1 + buffer_pct / 100.0)
+    if dry_run or client is None:
+        log.info(f"    [dry-run wallet check]  would ensure ${target:,.2f} USDT in spot")
+        return
+
+    have = get_spot_coin_balance(client, "USDT")
+    if have >= target:
+        log.info(f"    Spot wallet has ${have:,.2f} USDT (>= ${target:,.2f} needed) — no transfer needed")
+        return
+
+    shortfall = target - have
+    fut_available = get_futures_usdt_available(client)
+    if fut_available < shortfall:
+        raise RuntimeError(
+            f"Cannot fund spot leg: need ${shortfall:,.2f} USDT but only "
+            f"${fut_available:,.2f} available in futures wallet"
+        )
+    transfer_internal(
+        from_type="usdt_futures", to_type="spot",
+        amount=shortfall, coin="USDT",
+        client=client, dry_run=False,
+    )
+
+
 # ---------- Order execution from a DiffAction ----------
 
 def _place_carry_open(action: DiffAction, config: BitgetConfig, client: BitgetClient | None,
@@ -150,6 +193,8 @@ def _place_carry_open(action: DiffAction, config: BitgetConfig, client: BitgetCl
         return []
     out: list[OrderResult] = []
     if action.spot_qty > 0:
+        # Make sure the spot wallet has USDT (auto-transfer from futures if needed)
+        _ensure_spot_usdt(action.spot_qty * action.spot_price, client, dry_run)
         out.append(place_order(
             info=spot_info, side="Buy", qty=action.spot_qty,
             order_type="Market", reference_price=action.spot_price,
@@ -193,6 +238,7 @@ def _place_ema_open(
         log.info(f"    [SKIP] {action.symbol} EMA: {spec.rejection_reason}")
         return []
     results: list = []
+    _ensure_spot_usdt(spec.qty * action.spot_price, client, dry_run)
     results.append(place_order(
         info=info, side="Buy", qty=spec.qty, order_type="Market",
         reference_price=action.spot_price,

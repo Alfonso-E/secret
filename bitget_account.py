@@ -97,6 +97,22 @@ def get_wallet_balance(client: BitgetClient) -> WalletSnapshot:
     )
 
 
+def get_spot_coin_balance(client: BitgetClient, coin: str = "USDT") -> float:
+    """Return spendable spot balance of a single coin (e.g., USDT)."""
+    data = client.get("/api/v2/spot/account/assets", {"coin": coin})
+    for r in (data.get("data") or []):
+        if r.get("coin") == coin:
+            return _to_float(r.get("available"))
+    return 0.0
+
+
+def get_futures_usdt_available(client: BitgetClient) -> float:
+    """USDT in the futures wallet that's free to transfer out (not locked in margin)."""
+    data = client.get("/api/v2/mix/account/accounts", {"productType": "usdt-futures"})
+    entry = (data.get("data") or [{}])[0]
+    return _to_float(entry.get("available") or entry.get("crossedMaxAvailable"))
+
+
 def get_positions(client: BitgetClient, product_type: str = "usdt-futures") -> pd.DataFrame:
     """List open USDT-perp positions."""
     data = client.get(
