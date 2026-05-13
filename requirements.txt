@@ -1,0 +1,9 @@
+# Runtime dependencies for the live bot.
+# Pinned to known-good major versions; loose minor to allow security patches.
+pandas>=2.1,<3.0
+requests>=2.31,<3.0
+numpy>=1.26,<2.5
+
+# Used by the optional ML predictor (run_ml.py). Not needed for live trading
+# but installed for completeness so backtest scripts work on the same host.
+lightgbm>=4.0,<5.0

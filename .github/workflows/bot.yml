@@ -1,0 +1,90 @@
+# Hourly trading bot run on GitHub-hosted runners.
+#
+# Cost: free for public repos; ~360 min/month for hourly runs, well under the
+# 2,000-min free tier for private repos.
+#
+# Cron schedule is BEST-EFFORT on GitHub Actions (can be delayed 5-15 min during
+# peak load). Our strategy rebalances on smoothed funding rates, so a few minutes
+# of jitter is fine — we still catch each 8h funding window.
+#
+# Manual triggering: Actions tab in your repo -> Crypto trading bot -> "Run workflow".
+
+name: Crypto trading bot
+
+on:
+  schedule:
+    - cron: "0 * * * *"        # hourly, at minute :00 UTC
+  workflow_dispatch:            # also allow manual triggering from the UI
+    inputs:
+      live:
+        description: "Submit real orders? (otherwise dry-run)"
+        type: boolean
+        default: false
+
+# Limit to a single concurrent run — if a previous cycle is still going,
+# skip this one rather than racing it.
+concurrency:
+  group: trading-bot
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      # === Credentials are configured in:
+      #   GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository secret
+      BITGET_ENV:           ${{ secrets.BITGET_ENV || 'demo' }}
+      BITGET_API_KEY:        ${{ secrets.BITGET_API_KEY }}
+      BITGET_API_SECRET:     ${{ secrets.BITGET_API_SECRET }}
+      BITGET_API_PASSPHRASE: ${{ secrets.BITGET_API_PASSPHRASE }}
+      # Set this repo VARIABLE (not secret) to "true" when you're ready to flip
+      # to real demo trading. Default: dry-run.
+      BOT_LIVE: ${{ vars.BOT_LIVE || 'false' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore market-data cache
+        uses: actions/cache@v4
+        with:
+          path: data/
+          # Bumping the suffix invalidates the cache. Daily key is fine —
+          # the bot top-up-fetches new candles each run anyway.
+          key:  market-data-${{ github.run_number }}
+          restore-keys: |
+            market-data-
+
+      - name: Run bot (single pass)
+        run: |
+          MODE_FLAG=""
+          # The manual-trigger input takes precedence over the repo variable.
+          if [ "${{ github.event.inputs.live }}" = "true" ] || [ "$BOT_LIVE" = "true" ]; then
+            MODE_FLAG="--live"
+            echo "::warning ::Running in LIVE mode — orders will actually be submitted."
+          else
+            echo "Running in DRY-RUN mode."
+          fi
+          python live_bot.py $MODE_FLAG
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 14

@@ -1,0 +1,24 @@
+# Keep image small — exclude things the bot doesn't need at runtime.
+.env
+.env.local
+.env.live
+.env.demo
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local caches + logs — provided at runtime via mounted volumes
+data/
+logs/
+
+# Docs and dev-only files
+DEPLOY.md
+README.md
+*.md
