@@ -144,10 +144,10 @@ def _ensure_spot_usdt(
 ) -> None:
     """Make sure the spot wallet holds at least `needed_usd * (1 + buffer_pct/100)`.
 
-    If short, transfer the shortfall in from the USDT-futures wallet. In dry-run
-    mode we just log the intended transfer. On a fresh demo account where all
-    USDT lives in the futures wallet, this is the step that unblocks the spot
-    leg of the carry trade.
+    Live mode: if short, transfer the shortfall from the USDT-futures wallet.
+    Demo mode: Bitget blocks inter-wallet transfers on demo accounts, so we
+    raise a clear, actionable error telling the user how to fund the spot
+    demo wallet manually via the UI.
     """
     if needed_usd <= 0:
         return
@@ -158,10 +158,23 @@ def _ensure_spot_usdt(
 
     have = get_spot_coin_balance(client, "USDT")
     if have >= target:
-        log.info(f"    Spot wallet has ${have:,.2f} USDT (>= ${target:,.2f} needed) — no transfer needed")
+        log.info(f"    Spot wallet has ${have:,.2f} USDT (>= ${target:,.2f} needed)")
         return
 
     shortfall = target - have
+
+    # Demo trading on Bitget doesn't support inter-wallet transfers — the API
+    # endpoint returns 40404. The user must manually fund the spot demo wallet
+    # from the Bitget Demo UI. Surface a clear, actionable error.
+    if client.config.is_demo:
+        raise RuntimeError(
+            f"Spot wallet has only ${have:.2f} USDT but needs ${target:.2f} for this trade. "
+            f"Bitget DEMO accounts can't auto-transfer between sub-wallets — you have to fund "
+            f"the spot demo wallet from the Bitget UI manually. "
+            f"Open Bitget -> Demo Trading -> Spot, then use 'Reset Balance' / 'Recharge Demo Funds' "
+            f"to put at least ${shortfall:.0f} USDT in the spot demo wallet. Re-run after that."
+        )
+
     fut_available = get_futures_usdt_available(client)
     if fut_available < shortfall:
         raise RuntimeError(
