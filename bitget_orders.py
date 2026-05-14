@@ -239,6 +239,10 @@ def place_spot_stop_loss(
     qty_str = format_qty(info, qty)
     trigger_str = format_price(info, trigger_price)
 
+    # Bitget V2 spot plan order body. Bitget rejected planType="normal_plan"
+    # with code=40020 'Parameter {0} error' in a real live run. Correct V2
+    # value for a size-in-base-coin trigger order is planType="amount".
+    # "executePrice": "0" is the documented marker for market-type execution.
     body = {
         "symbol":       info.symbol,
         "side":         side.lower(),
@@ -246,7 +250,8 @@ def place_spot_stop_loss(
         "triggerPrice": trigger_str,
         "triggerType":  trigger_type,
         "orderType":    "market",
-        "planType":     "normal_plan",
+        "executePrice": "0",
+        "planType":     "amount",
     }
     path = "/api/v2/spot/trade/place-plan-order"
 

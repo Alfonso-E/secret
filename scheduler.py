@@ -50,11 +50,17 @@ DATA_DIR = Path(__file__).parent / "data"
 
 # BTC is reserved for the EMA directional overlay so we can disambiguate
 # "this BTC spot is the EMA position" vs "this BTC spot is the carry leg".
-# The carry universe is the remaining positive-funding majors.
+# Carry universe expanded 2026-05-14 to 12 positive-funding mid-caps after
+# backtesting NEAR/OP/FIL/LTC/DOT lifted CAGR ~0.4pp with same DD profile.
+# Excluded: BCH (negative funding), ATOM (~1.8% APR — too low to ever pick),
+# MATIC (truncated data on Bybit — likely renamed). BNB also excluded from
+# the start (negative funding throughout the test window).
 CARRY_UNIVERSE = [
-    "ETHUSDT", "SOLUSDT",
+    "ETHUSDT",  "SOLUSDT",
     "AVAXUSDT", "LINKUSDT", "ARBUSDT",
     "DOGEUSDT", "ADAUSDT",
+    "NEARUSDT", "OPUSDT",   "FILUSDT",
+    "LTCUSDT",  "DOTUSDT",
 ]
 EMA_SYMBOL = "BTCUSDT"
 
@@ -82,6 +88,11 @@ class StrategyConfig:
     # fraction of current price; halt + flatten if it falls below `liq_halt_pct`.
     liq_warn_pct:  float = 0.10
     liq_halt_pct:  float = 0.05
+    # On-exchange stop-loss for the EMA leg via Bitget plan order. If False,
+    # the EMA still has stops via the hourly signal-based death-cross exit;
+    # we just lose intra-bar protection. Disabled by default while we
+    # validate the corrected V2 plan-order body in live.
+    ema_onchain_stop_enabled: bool = False
     ema_params:    StrategyParams = StrategyParams(ema_fast=50, ema_slow=200, trend_ema=200)
     # HMM regime filter for the EMA leg. Backtested 2024-2026 OOS:
     # bull window CAGR +79% -> +98%, DD -15% -> -11%; recent window DD -25% -> -12%.
@@ -431,6 +442,7 @@ def _place_carry_close(action: DiffAction, config: BitgetConfig, client: BitgetC
 def _place_ema_open(
     action: DiffAction, config: BitgetConfig, client: BitgetClient | None,
     dry_run: bool, atr: float, stop_mult: float,
+    onchain_stop_enabled: bool = False,
 ) -> list:
     info = fetch_symbol_info(action.symbol, "spot", config)
     spec = ema_position_size(info=info, price=action.spot_price, capital_usd=action.notional_usd)
@@ -448,7 +460,14 @@ def _place_ema_open(
     # estimated from the last close minus stop_mult * ATR; the real fill
     # price will differ slightly, but this matches the backtest's stop logic
     # closely enough that live behavior should track backtest expectations.
-    if atr > 0 and stop_mult > 0:
+    #
+    # IMPORTANT: catch ANY exception here, not just ValueError. The Bitget
+    # plan-order endpoint can return error codes (BitgetAPIError) that
+    # otherwise propagate up and crash the whole cycle, leaving the EMA
+    # position open but unmanaged. Failing-open is correct: if the stop
+    # can't be placed, the position still has the hourly signal exit
+    # (death cross) as a backup; we just lose intra-bar protection.
+    if onchain_stop_enabled and atr > 0 and stop_mult > 0:
         stop_price = action.spot_price - stop_mult * atr
         if stop_price > 0:
             try:
@@ -457,8 +476,9 @@ def _place_ema_open(
                     trigger_price=stop_price, trigger_type="fill_price",
                     client=client, dry_run=dry_run,
                 ))
-            except ValueError as e:
-                log.warning(f"    [WARN] could not place EMA stop: {e}")
+            except Exception as e:
+                log.warning(f"    [WARN] could not place EMA stop ({type(e).__name__}: {e}) — "
+                            f"position open, will rely on hourly signal exit instead")
     return results
 
 
@@ -659,6 +679,7 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
                 all_orders.extend(_place_ema_open(
                     action, inputs.config, inputs.client, inputs.dry_run,
                     atr=ema_state["atr"], stop_mult=cfg.ema_params.atr_stop_mult,
+                    onchain_stop_enabled=cfg.ema_onchain_stop_enabled,
                 ))
                 guards.register_position_change(f"{action.symbol}_ema", action.notional_usd)
                 if not inputs.dry_run:
