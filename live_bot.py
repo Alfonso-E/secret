@@ -348,6 +348,11 @@ def main() -> int:
             allowed = ema_state_info.get("hmm_allowed", False)
             gate = "ALLOW" if allowed else "BLOCK"
             extra_lines.append(f"BTC HMM regime: state {state} ({gate} EMA entries)")
+        # Vol-targeting multiplier (carry leg only).
+        vol_mult = result.get("vol_multiplier")
+        if vol_mult is not None and abs(vol_mult - 1.0) > 0.01:
+            direction = "scale UP" if vol_mult > 1.0 else "scale DOWN"
+            extra_lines.append(f"Carry vol-target: x{vol_mult:.2f} ({direction})")
         extra_lines.append(f"Runs since start: {persistent.total_runs}")
 
         notify_daily_summary(

@@ -173,6 +173,7 @@ def backtest_cross_sectional(
     rebalance_every: int = 21,         # ~weekly on 8h funding cadence
     min_switch_advantage: float = 0.0002,  # smoothed rate must beat current by this
     config: CarryConfig = CarryConfig(),
+    vol_multipliers: pd.Series | None = None,  # per-time position-size scaler; 1.0 = no change
 ) -> CarryResult:
     """At each rebalance point, hold the asset with the highest smoothed rate.
 
@@ -233,9 +234,12 @@ def backtest_cross_sectional(
                     entries += 1
                 current = desired
 
-        # Accrue funding for the held symbol every period
+        # Accrue funding for the held symbol every period. Notional is scaled
+        # by the vol multiplier when one is supplied (else 1.0 -> no change).
         if current >= 0 and not np.isinf(rates_arr[i, current]):
-            notional = config.carry_notional(cap)
+            from vol_targeting import mult_at
+            vol_mult = mult_at(vol_multipliers, aligned.index[i])
+            notional = config.carry_notional(cap) * vol_mult
             clipped = _clipped_funding(rates_arr[i, current], config)
             period_pnl = notional * clipped
             cap += period_pnl

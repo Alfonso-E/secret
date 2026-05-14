@@ -55,6 +55,7 @@ def run_backtest(
     signals: pd.DataFrame,
     params: StrategyParams,
     config: BacktestConfig = BacktestConfig(),
+    vol_multipliers: pd.Series | None = None,  # per-time position-size scaler; 1.0 = no change
 ) -> BacktestResult:
     """Walk the dataframe forward, simulate trades, return equity + trade log."""
     needed = {"open", "high", "low", "close", "atr", "long_entry", "long_exit"}
@@ -91,7 +92,9 @@ def run_backtest(
         # 1) Execute pending actions at this bar's open.
         if pending == "open" and size == 0.0:
             entry_price = opens[i]
-            notional = cash * config.position_fraction
+            from vol_targeting import mult_at
+            vol_mult = mult_at(vol_multipliers, times[i])
+            notional = cash * config.position_fraction * vol_mult
             size = notional / entry_price
             cash -= notional
             cash -= notional * config.fee_rate

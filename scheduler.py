@@ -38,6 +38,7 @@ from notify import notify_error, notify_halt, notify_trade
 from regime_hmm import build_features as hmm_build_features
 from regime_hmm import predict_current_state as hmm_predict_current
 from regime_hmm import train_hmm
+from vol_targeting import compute_vol_multipliers
 from reconcile import (
     CarryIntent, DiffAction, EmaIntent, PositionView, compute_diff, fetch_state,
 )
@@ -89,6 +90,20 @@ class StrategyConfig:
     ema_hmm_n_states:       int  = 3        # 3-state held up OOS; 5-state overfit
     ema_hmm_allowed_states: tuple[int, ...] = (2,)  # state 2 = top-mean-return state
     ema_hmm_window:         int  = 7 * 24   # rolling-inference window for live predict
+    # Vol-targeted position sizing on the CARRY leg.
+    # First backtest (max_mult=1.5) showed +0.9pp CAGR improvement, but that
+    # came entirely from scaling UP during calm periods — which would push
+    # effective leverage 5x -> 7.5x and oversize positions beyond the wallet
+    # (and breach max_leverage=7.0). The backtest didn't enforce that constraint.
+    # Re-running with max_mult=1.0 (realistic, scale-DOWN only): variant
+    # actually becomes slightly worse than baseline. So default is OFF.
+    # Code is left in place for possible later re-use as a "vol circuit
+    # breaker" only-activate-in-extreme-events variant.
+    carry_vol_target_enabled: bool = False
+    carry_vol_target_annual:  float = 0.50
+    carry_vol_target_lookback_hours: int = 14 * 24
+    carry_vol_target_min_mult: float = 0.30
+    carry_vol_target_max_mult: float = 1.00
 
 
 @dataclass
@@ -526,7 +541,27 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
         force_exit_negative_streak=cfg.carry_force_exit_negative_streak,
     )
     carry_capital = cfg.total_capital_usd * cfg.carry_fraction
-    carry_notional = carry_capital * cfg.carry_leverage / (cfg.carry_leverage + 1)
+    carry_base_notional = carry_capital * cfg.carry_leverage / (cfg.carry_leverage + 1)
+
+    # Volatility-targeted position sizing: scale notional by BTC realized vol.
+    # When the market is calm, scale UP (multiplier > 1); when stormy, scale DOWN.
+    vol_mult = 1.0
+    if cfg.carry_vol_target_enabled:
+        try:
+            mult_series = compute_vol_multipliers(
+                inputs.btc_klines,
+                target_annualized_vol=cfg.carry_vol_target_annual,
+                lookback_hours=cfg.carry_vol_target_lookback_hours,
+                min_mult=cfg.carry_vol_target_min_mult,
+                max_mult=cfg.carry_vol_target_max_mult,
+            )
+            last = mult_series.dropna()
+            if len(last) > 0:
+                vol_mult = float(last.iloc[-1])
+        except Exception as e:
+            log.warning(f"  [VOL-TARGET] failed to compute multiplier ({type(e).__name__}: {e}); using 1.0")
+    carry_notional = carry_base_notional * vol_mult
+
     final_target = target if target in CARRY_UNIVERSE else None
     if final_target is not None and final_target in force_flatten:
         log.warning(f"  Override: target {final_target} is in liquidation-halt set — forcing flat")
@@ -557,6 +592,9 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
               f"(smoothed rate {target_rate:+.6f}/8h = {annualized:+.2f}% APR) — {target_reason}")
     else:
         log.info(f"  Carry: stay flat — {target_reason}")
+    if cfg.carry_vol_target_enabled:
+        log.info(f"         vol-target mult={vol_mult:.3f}  (base notional ${carry_base_notional:,.0f} -> "
+                 f"${carry_base_notional * vol_mult:,.0f})")
     log.info(f"  EMA  : want_long_btc={ema_intent.want_long_btc}  notional ${ema_intent.target_notional_usd:,.0f}  "
           f"reason='{ema_reason}'")
     log.info(f"         (bar @ {ema_state['time']}  close=${ema_state['close']:,.2f}  "
@@ -659,5 +697,6 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
         "actions": actions,
         "orders": all_orders,
         "ema_state": ema_state,
+        "vol_multiplier": vol_mult,
         "total_notional_usd": state.total_notional_usd,
     }
