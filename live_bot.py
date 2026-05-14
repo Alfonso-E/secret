@@ -340,6 +340,14 @@ def main() -> int:
                         extra_lines.append(f"{sym} liq buffer ~{buffer:.1f}%")
             except Exception as e:
                 extra_lines.append(f"(could not enrich: {type(e).__name__})")
+        # Current BTC regime (HMM) — useful to see whether the EMA leg is
+        # currently in "allowed" or "blocked" state without checking the logs.
+        ema_state_info = result.get("ema_state", {})
+        if ema_state_info.get("hmm_enabled"):
+            state = ema_state_info.get("hmm_state", -1)
+            allowed = ema_state_info.get("hmm_allowed", False)
+            gate = "ALLOW" if allowed else "BLOCK"
+            extra_lines.append(f"BTC HMM regime: state {state} ({gate} EMA entries)")
         extra_lines.append(f"Runs since start: {persistent.total_runs}")
 
         notify_daily_summary(

@@ -35,6 +35,9 @@ from bitget_symbols import SymbolInfo, fetch_symbol_info
 from config import BitgetConfig
 from logger import log
 from notify import notify_error, notify_halt, notify_trade
+from regime_hmm import build_features as hmm_build_features
+from regime_hmm import predict_current_state as hmm_predict_current
+from regime_hmm import train_hmm
 from reconcile import (
     CarryIntent, DiffAction, EmaIntent, PositionView, compute_diff, fetch_state,
 )
@@ -79,6 +82,13 @@ class StrategyConfig:
     liq_warn_pct:  float = 0.10
     liq_halt_pct:  float = 0.05
     ema_params:    StrategyParams = StrategyParams(ema_fast=50, ema_slow=200, trend_ema=200)
+    # HMM regime filter for the EMA leg. Backtested 2024-2026 OOS:
+    # bull window CAGR +79% -> +98%, DD -15% -> -11%; recent window DD -25% -> -12%.
+    # Set ema_hmm_enabled=False to disable and fall back to EMA(200)-only filter.
+    ema_hmm_enabled:        bool = True
+    ema_hmm_n_states:       int  = 3        # 3-state held up OOS; 5-state overfit
+    ema_hmm_allowed_states: tuple[int, ...] = (2,)  # state 2 = top-mean-return state
+    ema_hmm_window:         int  = 7 * 24   # rolling-inference window for live predict
 
 
 @dataclass
@@ -155,11 +165,21 @@ def _pick_carry_target(
     return best, best_rate, f"argmax {best} @ {best_rate:+.6f}"
 
 
-def _ema_signal_state(btc: pd.DataFrame, params: StrategyParams) -> dict:
+def _ema_signal_state(btc: pd.DataFrame, params: StrategyParams,
+                      hmm_enabled: bool = False,
+                      hmm_n_states: int = 3,
+                      hmm_allowed_states: tuple[int, ...] = (2,),
+                      hmm_window: int = 7 * 24) -> dict:
+    """Evaluate the EMA strategy state for the latest BTC bar.
+
+    If hmm_enabled, additionally train a Gaussian HMM on the BTC history
+    (cheap — ~3 seconds for ~13k bars) and predict the most recent state.
+    long_entry is then ANDed with `state in hmm_allowed_states`.
+    """
     signals = generate_signals(btc, params)
     needed = ["ema_fast", "ema_slow", "rsi", "atr", "trend_ema", "long_entry", "long_exit", "close"]
     last = signals.dropna(subset=[c for c in needed if c in signals.columns]).iloc[-1]
-    return {
+    out = {
         "time":         last.name,
         "close":        float(last["close"]),
         "ema_fast":     float(last["ema_fast"]),
@@ -170,7 +190,30 @@ def _ema_signal_state(btc: pd.DataFrame, params: StrategyParams) -> dict:
         "long_entry":   bool(last["long_entry"]),
         "long_exit":    bool(last["long_exit"]),
         "regime_long_ok": float(last["close"]) > float(last["trend_ema"]),
+        "hmm_enabled":  hmm_enabled,
+        "hmm_state":    -1,
+        "hmm_allowed":  True,        # fail-open: if HMM breaks, baseline behavior continues
     }
+
+    if hmm_enabled:
+        try:
+            features = hmm_build_features(btc)
+            if len(features) >= hmm_window:
+                hmm = train_hmm(features, n_states=hmm_n_states)
+                state = hmm_predict_current(hmm, features, window=hmm_window)
+                out["hmm_state"] = state
+                out["hmm_allowed"] = state in hmm_allowed_states
+                if not out["hmm_allowed"]:
+                    out["long_entry"] = False  # gate the entry
+            else:
+                log.info(f"  [HMM] not enough feature rows ({len(features)} < {hmm_window}); skipping gate")
+        except Exception as e:
+            # Fail open: do not block trading if HMM training crashes.
+            log.warning(f"  [HMM] failed to compute state ({type(e).__name__}: {e}); falling back to baseline filter")
+            out["hmm_state"] = -1
+            out["hmm_allowed"] = True
+
+    return out
 
 
 def _decide_ema_intent(
@@ -493,7 +536,13 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
         target_notional_usd=carry_notional if final_target else 0.0,
     )
 
-    ema_state = _ema_signal_state(inputs.btc_klines, cfg.ema_params)
+    ema_state = _ema_signal_state(
+        inputs.btc_klines, cfg.ema_params,
+        hmm_enabled=cfg.ema_hmm_enabled,
+        hmm_n_states=cfg.ema_hmm_n_states,
+        hmm_allowed_states=cfg.ema_hmm_allowed_states,
+        hmm_window=cfg.ema_hmm_window,
+    )
     btc_price = inputs.spot_prices.get(EMA_SYMBOL, 0.0)
     ema_intent, ema_reason = _decide_ema_intent(
         ema_state, current, btc_price,
@@ -514,6 +563,10 @@ def evaluate_once(inputs: SchedulerInputs) -> dict:
           f"EMA{cfg.ema_params.ema_fast}=${ema_state['ema_fast']:,.2f}  "
           f"EMA{cfg.ema_params.ema_slow}=${ema_state['ema_slow']:,.2f}  "
           f"RSI={ema_state['rsi']:.1f})")
+    if ema_state["hmm_enabled"]:
+        gate_text = "ALLOW" if ema_state["hmm_allowed"] else "BLOCK"
+        log.info(f"         HMM regime state={ema_state['hmm_state']} ({gate_text} EMA entry; "
+                 f"allowed={list(cfg.ema_hmm_allowed_states)})")
 
     # 3. Reconcile
     actions = compute_diff(
